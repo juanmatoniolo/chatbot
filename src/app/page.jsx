@@ -1,216 +1,191 @@
 // src/app/page.jsx
 "use client";
 
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import styles from "./page.module.css";
 
 export default function Home() {
-  const [message, setMessage] = useState("");
-  const [result, setResult] = useState(null);
+  const [input, setInput] = useState("");
+  const [messages, setMessages] = useState([]); // {id, role, text, data, error}
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const scrollRef = useRef(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, loading]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!message.trim()) return;
+    const text = input.trim();
+    if (!text || loading) return;
 
+    const userMsg = { id: crypto.randomUUID(), role: "user", text };
+    setMessages((prev) => [...prev, userMsg]);
+    setInput("");
     setLoading(true);
-    setResult(null);
-    setError(null);
 
     try {
-      const response = await fetch("/api/filter", {
+      const res = await fetch("/api/filter", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ message: text }),
       });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Error en la respuesta del servidor");
 
-      if (!response.ok) {
-        const errBody = await response.json().catch(() => ({}));
-        throw new Error(errBody.error || "Error en la respuesta del servidor");
-      }
-
-      const data = await response.json();
-      setResult(data);
+      setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "assistant", data }]);
     } catch (err) {
-      console.error("Error:", err);
-      setError(err.message);
+      setMessages((prev) => [
+        ...prev,
+        { id: crypto.randomUUID(), role: "assistant", error: err.message },
+      ]);
     } finally {
       setLoading(false);
+      inputRef.current?.focus();
     }
   };
 
   return (
-    <main className={styles.container}>
-      <h1 className={styles.title}>🏥 Consulta Clínica</h1>
-      <p className={styles.subtitle}>
-        Preguntá por pacientes, facturas, siniestros, UTI o cirugías.
-      </p>
+    <div className={styles.page}>
+      {/* Header */}
+      <header className={styles.header}>
+        <h1 className={styles.title}>🏥 Consulta Clínica</h1>
+        <p className={styles.subtitle}>Pacientes, facturas, siniestros, UTI o cirugías</p>
+      </header>
 
-      <div className={styles.chatBox}>
-        {message && <div className={styles.userMessage}>{message}</div>}
+      {/* Historial */}
+      <div ref={scrollRef} className={styles.history}>
+        {messages.length === 0 && (
+          <div className={styles.emptyState}>
+            <p>Ejemplos de consulta</p>
+            <ul>
+              <li>&ldquo;¿Cuántas facturas hay de IAPS ART?&rdquo;</li>
+              <li>&ldquo;¿Qué pacientes están en UTI ahora?&rdquo;</li>
+              <li>&ldquo;Busca al paciente con DNI 25620629&rdquo;</li>
+            </ul>
+          </div>
+        )}
+
+        {messages.map((m) =>
+          m.role === "user" ? (
+            <div key={m.id} className={styles.rowUser}>
+              <div className={styles.bubbleUser}>{m.text}</div>
+            </div>
+          ) : (
+            <div key={m.id} className={styles.rowAssistant}>
+              <AssistantBubble data={m.data} error={m.error} />
+            </div>
+          )
+        )}
 
         {loading && (
-          <div className={styles.loading}>Analizando tu consulta con IA...</div>
-        )}
-
-        {error && (
-          <div className={styles.aiResponse} style={{ borderLeft: "4px solid #dc2626" }}>
-            <p style={{ color: "#dc2626", margin: 0 }}>
-              <strong>Error:</strong> {error}
-            </p>
-          </div>
-        )}
-
-        {result && !error && (
-          <div className={styles.aiResponse}>
-            {/* Filtros que extrajo la IA */}
-            <p>
-              <strong>Filtros aplicados:</strong>
-            </p>
-            <div className={styles.filtersApplied}>
-              <ul>
-                <li>
-                  Entidad: <strong>{result.filters?.entidad || "—"}</strong>
-                </li>
-                {result.filters?.artSeguro && (
-                  <li>
-                    Obra social: <strong>{result.filters.artSeguro}</strong>
-                  </li>
-                )}
-                {result.filters?.dni && (
-                  <li>
-                    DNI: <strong>{result.filters.dni}</strong>
-                  </li>
-                )}
-                {result.filters?.pacienteNombre && (
-                  <li>
-                    Paciente: <strong>{result.filters.pacienteNombre}</strong>
-                  </li>
-                )}
-                {result.filters?.estado && (
-                  <li>
-                    Estado: <strong>{result.filters.estado}</strong>
-                  </li>
-                )}
-                {result.filters?.activo !== undefined && (
-                  <li>
-                    Activo: <strong>{String(result.filters.activo)}</strong>
-                  </li>
-                )}
-                {result.filters?.fechaDesde && (
-                  <li>
-                    Desde: <strong>{result.filters.fechaDesde}</strong>
-                  </li>
-                )}
-                {result.filters?.fechaHasta && (
-                  <li>
-                    Hasta: <strong>{result.filters.fechaHasta}</strong>
-                  </li>
-                )}
-                {result.filters?.totalMin && (
-                  <li>
-                    Total mín: <strong>${result.filters.totalMin.toLocaleString("es-AR")}</strong>
-                  </li>
-                )}
-              </ul>
+          <div className={styles.rowAssistant}>
+            <div className={styles.typing}>
+              <span className={styles.dot} style={{ animationDelay: "0ms" }} />
+              <span className={styles.dot} style={{ animationDelay: "150ms" }} />
+              <span className={styles.dot} style={{ animationDelay: "300ms" }} />
             </div>
-
-            {/* Caso 1: respuesta tipo conteo */}
-            {result.mensaje && !result.results && (
-              <p style={{ marginTop: "1rem", fontSize: "1.1rem" }}>
-                <strong>{result.mensaje}</strong>
-              </p>
-            )}
-
-            {/* Caso 2: respuesta tipo lista */}
-            {Array.isArray(result.results) && result.results.length > 0 && (
-              <>
-                <p>
-                  Encontré <strong>{result.total}</strong> resultado(s):
-                </p>
-                <div className={styles.productGrid}>
-                  {result.results.map((item, idx) => (
-                    <div key={item.id || idx} className={styles.productCard}>
-                      <h3 className={styles.productName}>
-                        {item.paciente?.nombreCompleto ||
-                          item.pacienteDatos?.nombreCompleto ||
-                          item.nombre ||
-                          item.paciente ||
-                          "Sin nombre"}
-                      </h3>
-                      <p className={styles.productDescription}>
-                        {item.paciente?.artSeguro ||
-                          item.pacienteDatos?.artSeguro ||
-                          item.artSeguro ||
-                          item.artKey ||
-                          "—"}
-                      </p>
-                      <div className={styles.productMeta}>
-                        <span>
-                          DNI:{" "}
-                          {item.paciente?.dni ||
-                            item.pacienteDatos?.dni ||
-                            item.dni ||
-                            "—"}
-                        </span>
-                        {item.estado && <span>Estado: {item.estado}</span>}
-                      </div>
-                      {item.totales?.total && (
-                        <p className={styles.productPrice}>
-                          ${item.totales.total.toLocaleString("es-AR")}
-                        </p>
-                      )}
-                      {item.fechaAtencion && (
-                        <p style={{ fontSize: "0.85rem", color: "#888" }}>
-                          Fecha: {item.fechaAtencion}
-                        </p>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-
-            {/* Caso 3: lista vacía */}
-            {Array.isArray(result.results) && result.results.length === 0 && (
-              <p className={styles.noResults}>
-                😔 No se encontraron resultados con esos filtros.
-              </p>
-            )}
           </div>
-        )}
-
-        {!message && !result && !loading && !error && (
-          <p style={{ textAlign: "center", color: "#999" }}>
-            Ejemplos:
-            <br />
-            &ldquo;¿Cuántas facturas hay de IAPS ART?&rdquo;
-            <br />
-            &ldquo;¿Qué pacientes están internados en UTI ahora?&rdquo;
-            <br />
-            &ldquo;Busca al paciente con DNI 25620629&rdquo;
-          </p>
         )}
       </div>
 
-      <form onSubmit={handleSubmit} className={styles.inputArea}>
-        <input
-          type="text"
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-          placeholder="Escribí tu consulta..."
-          className={styles.input}
-          disabled={loading}
-        />
-        <button
-          type="submit"
-          className={styles.button}
-          disabled={loading || !message.trim()}
-        >
-          {loading ? "Buscando..." : "Consultar"}
-        </button>
+      {/* Input */}
+      <form onSubmit={handleSubmit} className={styles.form}>
+        <div className={styles.inputWrapper}>
+          <input
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Escribí tu consulta..."
+            disabled={loading}
+            enterKeyHint="send"
+            className={styles.input}
+          />
+          <button
+            type="submit"
+            disabled={loading || !input.trim()}
+            aria-label="Enviar"
+            className={styles.sendButton}
+          >
+            <svg viewBox="0 0 24 24" fill="none" width="16" height="16">
+              <path d="M4 12L20 4L13 20L11 13L4 12Z" fill="currentColor" />
+            </svg>
+          </button>
+        </div>
       </form>
-    </main>
+    </div>
+  );
+}
+
+function AssistantBubble({ data, error }) {
+  if (error) {
+    return (
+      <div className={styles.bubbleError}>
+        <strong>Error:</strong> {error}
+      </div>
+    );
+  }
+
+  const f = data?.filters || {};
+  const hasList = Array.isArray(data?.results);
+
+  return (
+    <div className={styles.bubbleAssistant}>
+      <div className={styles.chips}>
+        {f.entidad && <span className={styles.chip}>{f.entidad}</span>}
+        {f.artSeguro && <span className={styles.chip}>{f.artSeguro}</span>}
+        {f.dni && <span className={styles.chip}>DNI {f.dni}</span>}
+        {f.pacienteNombre && <span className={styles.chip}>{f.pacienteNombre}</span>}
+        {f.estado && <span className={styles.chip}>{f.estado}</span>}
+        {f.activo !== undefined && (
+          <span className={styles.chip}>{f.activo ? "Internado" : "Alta"}</span>
+        )}
+      </div>
+
+      {data?.mensaje && !hasList && <p className={styles.mensaje}>{data.mensaje}</p>}
+
+      {hasList && data.results.length > 0 && (
+        <>
+          <p className={styles.resultCount}>{data.total} resultado(s) encontrado(s)</p>
+          <div className={styles.grid}>
+            {data.results.map((item, i) => (
+              <ResultCard key={item.id || i} item={item} />
+            ))}
+          </div>
+        </>
+      )}
+
+      {hasList && data.results.length === 0 && (
+        <p className={styles.noResults}>😔 Sin resultados con esos filtros.</p>
+      )}
+    </div>
+  );
+}
+
+function ResultCard({ item }) {
+  const nombre =
+    item.paciente?.nombreCompleto ||
+    item.pacienteDatos?.nombreCompleto ||
+    item.nombre ||
+    item.paciente ||
+    "Sin nombre";
+  const art =
+    item.paciente?.artSeguro || item.pacienteDatos?.artSeguro || item.artSeguro || item.artKey || "—";
+  const dni = item.paciente?.dni || item.pacienteDatos?.dni || item.dni || "—";
+
+  return (
+    <div className={styles.card}>
+      <p className={styles.cardName}>{nombre}</p>
+      <p className={styles.cardSub}>{art}</p>
+      <div className={styles.cardMeta}>
+        <span>DNI: {dni}</span>
+        {item.estado && <span>{item.estado}</span>}
+      </div>
+      {item.totales?.total && (
+        <p className={styles.cardPrice}>${item.totales.total.toLocaleString("es-AR")}</p>
+      )}
+      {item.fechaAtencion && <p className={styles.cardDate}>{item.fechaAtencion}</p>}
+    </div>
   );
 }
