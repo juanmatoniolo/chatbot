@@ -1,8 +1,4 @@
-// src/lib/entity-schema.js
-// Config central: qué nodos de Firebase son consultables por la IA, con qué
-// alias ("entidad") y en qué campos vive cada filtro. Agregar una entidad acá
-// alcanza para que el buscador la entienda — no hay que tocar route.js.
-
+// src/lib/entity-schema.js — SIN CAMBIOS respecto a la versión anterior
 export const EXCLUDED_NODES = [
 	"ART-MAILS",
 	"UTI",
@@ -77,7 +73,7 @@ export const ENTITY_SCHEMA = {
 		description:
 			"Convenios de ART con valores_generales y honorarios_medicos por complejidad.",
 		paths: { nombre: ["nombre"] },
-		idIsNombre: true, // la clave del nodo ES el nombre del convenio
+		idIsNombre: true,
 	},
 	historiaClinica: {
 		path: "historias-clinicas",

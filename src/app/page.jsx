@@ -25,11 +25,17 @@ export default function Home() {
     setInput("");
     setLoading(true);
 
+    // Historial de filtros ya resueltos, para preguntas de seguimiento
+    const historial = messages
+      .filter((m) => m.role === "assistant" && m.data?.filters)
+      .slice(-3)
+      .map((m) => m.data.filters);
+
     try {
       const res = await fetch("/api/filter", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: text, historial }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Error en la respuesta del servidor");
@@ -48,13 +54,11 @@ export default function Home() {
 
   return (
     <div className={styles.page}>
-      {/* Header */}
       <header className={styles.header}>
         <h1 className={styles.title}>🏥 Consulta Clínica</h1>
         <p className={styles.subtitle}>Pacientes, facturas, siniestros, UTI o cirugías</p>
       </header>
 
-      {/* Historial */}
       <div ref={scrollRef} className={styles.history}>
         {messages.length === 0 && (
           <div className={styles.emptyState}>
@@ -90,7 +94,6 @@ export default function Home() {
         )}
       </div>
 
-      {/* Input */}
       <form onSubmit={handleSubmit} className={styles.form}>
         <div className={styles.inputWrapper}>
           <input
@@ -127,22 +130,10 @@ function AssistantBubble({ data, error }) {
     );
   }
 
-  const f = data?.filters || {};
   const hasList = Array.isArray(data?.results);
 
   return (
     <div className={styles.bubbleAssistant}>
-      <div className={styles.chips}>
-        {f.entidad && <span className={styles.chip}>{f.entidad}</span>}
-        {f.artSeguro && <span className={styles.chip}>{f.artSeguro}</span>}
-        {f.dni && <span className={styles.chip}>DNI {f.dni}</span>}
-        {f.pacienteNombre && <span className={styles.chip}>{f.pacienteNombre}</span>}
-        {f.estado && <span className={styles.chip}>{f.estado}</span>}
-        {f.activo !== undefined && (
-          <span className={styles.chip}>{f.activo ? "Internado" : "Alta"}</span>
-        )}
-      </div>
-
       {data?.mensaje && !hasList && <p className={styles.mensaje}>{data.mensaje}</p>}
 
       {hasList && data.results.length > 0 && (
@@ -164,28 +155,22 @@ function AssistantBubble({ data, error }) {
 }
 
 function ResultCard({ item }) {
-  const nombre =
-    item.paciente?.nombreCompleto ||
-    item.pacienteDatos?.nombreCompleto ||
-    item.nombre ||
-    item.paciente ||
-    "Sin nombre";
-  const art =
-    item.paciente?.artSeguro || item.pacienteDatos?.artSeguro || item.artSeguro || item.artKey || "—";
-  const dni = item.paciente?.dni || item.pacienteDatos?.dni || item.dni || "—";
+  const d = item._display || {};
 
   return (
     <div className={styles.card}>
-      <p className={styles.cardName}>{nombre}</p>
-      <p className={styles.cardSub}>{art}</p>
-      <div className={styles.cardMeta}>
-        <span>DNI: {dni}</span>
-        {item.estado && <span>{item.estado}</span>}
-      </div>
-      {item.totales?.total && (
-        <p className={styles.cardPrice}>${item.totales.total.toLocaleString("es-AR")}</p>
+      <p className={styles.cardName}>{d.nombre || "Sin nombre"}</p>
+      {d.dni && <p className={styles.cardSub}>DNI: {d.dni}</p>}
+
+      {d.extra?.length > 0 && (
+        <div className={styles.cardMeta}>
+          {d.extra.map((e, i) => (
+            <span key={i}>
+              {typeof e.value === "boolean" ? (e.value ? "sí" : "no") : String(e.value)}
+            </span>
+          ))}
+        </div>
       )}
-      {item.fechaAtencion && <p className={styles.cardDate}>{item.fechaAtencion}</p>}
     </div>
   );
 }

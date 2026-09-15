@@ -4,9 +4,6 @@ import { z } from "zod";
 import { ENTITY_SCHEMA, ENTITY_KEYS } from "@/lib/entity-schema";
 import { getEntityData } from "@/lib/firebase-admin";
 
-// ---------------------------------------------------------------------------
-// Esquemas dinámicos (se arman solos a partir de ENTITY_SCHEMA)
-// ---------------------------------------------------------------------------
 const filterSchema = z.object({
 	entidad: z.enum(ENTITY_KEYS),
 	dni: z.string().optional(),
@@ -22,6 +19,8 @@ const filterSchema = z.object({
 	fechaHasta: z.string().optional(),
 	totalMin: z.number().optional(),
 	totalMax: z.number().optional(),
+	orden: z.enum(["reciente", "antiguo"]).optional(),
+	limite: z.number().int().min(1).max(100).optional(),
 	respuestaEsperada: z.enum(["lista", "conteo", "detalle"]),
 });
 
@@ -38,15 +37,9 @@ const googleResponseSchema = {
 			description: "Nombre o apellido de persona.",
 		},
 		art: { type: "STRING", description: "Obra social / ART." },
-		estado: {
-			type: "STRING",
-			description: "Estado del registro (ej. borrador, cerrado, activo).",
-		},
+		estado: { type: "STRING", description: "Estado del registro." },
 		activo: { type: "BOOLEAN" },
-		realizada: {
-			type: "BOOLEAN",
-			description: "Solo cirugía: true=realizada, false=pendiente.",
-		},
+		realizada: { type: "BOOLEAN", description: "Solo cirugía." },
 		especialidad: { type: "STRING", description: "Solo médicos." },
 		matricula: { type: "STRING", description: "Solo médicos." },
 		texto: {
@@ -57,6 +50,17 @@ const googleResponseSchema = {
 		fechaHasta: { type: "STRING", description: "ISO 8601." },
 		totalMin: { type: "NUMBER" },
 		totalMax: { type: "NUMBER" },
+		orden: {
+			type: "STRING",
+			enum: ["reciente", "antiguo"],
+			description:
+				"reciente = más nuevo primero, antiguo = más viejo primero.",
+		},
+		limite: {
+			type: "NUMBER",
+			description:
+				"Cuántos resultados devolver. 'el último/la última' = 1.",
+		},
 		respuestaEsperada: {
 			type: "STRING",
 			enum: ["lista", "conteo", "detalle"],
@@ -82,20 +86,54 @@ function matchesText(item, paths, query) {
 	});
 }
 
-// ---------------------------------------------------------------------------
-// Fallback entre modelos de Gemini
-// ---------------------------------------------------------------------------
-async function callGoogleWithFallback({ apiKey, prompt, responseSchema }) {
-	const models = [
-		"gemini-3.6-flash",
-		"gemini-3.6-pro",
-		"gemini-2.5-flash",
-		"gemini-2.5-pro",
+// Arma nombre/dni/campos-extra a partir del schema, sin asumir nombres de
+// campo específicos por entidad — el front-end no necesita conocer la
+// estructura interna de cada nodo de Firebase.
+function buildDisplay(item, entity) {
+	const nombre =
+		(entity.paths.nombre || [])
+			.map((p) => getByPath(item, p))
+			.filter(Boolean)
+			.join(" ") || null;
+
+	const dni = entity.paths.dni
+		? (getByPath(item, entity.paths.dni[0]) ?? null)
+		: null;
+
+	const extraKeys = [
+		"art",
+		"estado",
+		"especialidad",
+		"matricula",
+		"fecha",
+		"total",
+		"activo",
+		"realizada",
 	];
+	const extra = [];
+	for (const key of extraKeys) {
+		if (!entity.paths[key]) continue;
+		const val = entity.paths[key]
+			.map((p) => getByPath(item, p))
+			.find((v) => v !== undefined && v !== null && v !== "");
+		if (val === undefined || val === null || val === "") continue;
+		extra.push({ label: key, value: val });
+	}
+
+	return { nombre, dni, extra };
+}
+
+const MODELS = [
+	"gemini-2.5-flash",
+	"gemini-2.5-flash-lite",
+	"gemini-3.1-flash-lite",
+];
+
+async function callGoogleWithFallback({ apiKey, prompt, responseSchema }) {
 	const MAX_RETRIES = 2;
 	let lastError = null;
 
-	for (const model of models) {
+	for (const model of MODELS) {
 		for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
 			try {
 				const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
@@ -139,7 +177,11 @@ async function callGoogleWithFallback({ apiKey, prompt, responseSchema }) {
 
 export async function POST(request) {
 	try {
-		const { message } = await request.json();
+		const { message, historial } = await request.json();
+		// historial: array de los últimos `filters` ya resueltos en la
+		// conversación (los manda el front-end), para permitir preguntas
+		// de seguimiento tipo "¿y de esos, cuántos están cerrados?".
+
 		if (!message || typeof message !== "string" || !message.trim()) {
 			return NextResponse.json(
 				{ error: 'El campo "message" es requerido.' },
@@ -156,22 +198,34 @@ export async function POST(request) {
 		}
 
 		const hoy = new Date().toISOString().slice(0, 10);
-
 		const entidadesDescripcion = ENTITY_KEYS.map(
 			(k) => `- "${k}": ${ENTITY_SCHEMA[k].description}`,
 		).join("\n");
 
+		const contextoPrevio =
+			Array.isArray(historial) && historial.length > 0
+				? `\nÚltimos filtros aplicados en esta conversación (el más reciente al final):\n${historial
+						.slice(-3)
+						.map((f, i) => `${i + 1}. ${JSON.stringify(f)}`)
+						.join(
+							"\n",
+						)}\n\nSi la pregunta actual es una continuación ("y de esos...", "ahora filtrá por...", "y los que están cerrados"), partí del último filtro y modificá solo lo que cambie. Si es una pregunta nueva sin relación, ignorá el historial.\n`
+				: "";
+
 		const prompt = `Sos el asistente de búsqueda interno de una clínica médica. Traducí la pregunta a filtros estructurados.
-Hoy es ${hoy}. Usá esta fecha para calcular rangos relativos.
+Hoy es ${hoy}.
 
-Entidades disponibles (usá SOLO estas, no existen otras):
+Entidades disponibles (usá SOLO estas):
 ${entidadesDescripcion}
-
+${contextoPrevio}
 Reglas:
-- Si preguntan por el total de pacientes en general (sin contexto de factura, ART, cirugía, etc.), usá entidad="historiaClinica" — es el índice maestro de pacientes.
+- Si preguntan por el total de pacientes en general, usá entidad="historiaClinica".
 - DNI: solo dígitos, sin puntos ni guiones.
-- "cuántos/cuántas" → respuestaEsperada="conteo". "buscá/mostrame" → "lista". "contame sobre/detalle de" → "detalle".
-- Si la pregunta no encaja en ninguna entidad de la lista, elegí la más cercana igual.
+- "cuántos" → respuestaEsperada="conteo". "buscá/mostrame" → "lista". "contame sobre/detalle de" → "detalle".
+- "el último/la última ingresado/a", "el más reciente" → orden="reciente", limite=1.
+- "el primero/más antiguo" → orden="antiguo", limite=1.
+- "los últimos N" → orden="reciente", limite=N.
+- Si no se menciona orden, no lo incluyas (se asume reciente por defecto).
 
 Pregunta del usuario:
 "${message.trim()}"`;
@@ -189,7 +243,7 @@ Pregunta del usuario:
 		const entity = ENTITY_SCHEMA[filters.entidad];
 		const data = await getEntityData(filters.entidad);
 
-		const results = data.filter((item) => {
+		let results = data.filter((item) => {
 			if (filters.dni && entity.paths.dni) {
 				const itemDni = normalizeDigits(
 					getByPath(item, entity.paths.dni[0]) || "",
@@ -206,8 +260,8 @@ Pregunta del usuario:
 					return false;
 			}
 			if (filters.estado && entity.paths.estado) {
-				const itemEstado = getByPath(item, entity.paths.estado[0]);
-				if (itemEstado !== filters.estado) return false;
+				if (getByPath(item, entity.paths.estado[0]) !== filters.estado)
+					return false;
 			}
 			if (filters.activo !== undefined && entity.paths.activo) {
 				if (getByPath(item, entity.paths.activo[0]) !== filters.activo)
@@ -243,7 +297,6 @@ Pregunta del usuario:
 				if (!matchesText(item, entity.paths.texto, filters.texto))
 					return false;
 			}
-
 			if (
 				(filters.fechaDesde || filters.fechaHasta) &&
 				entity.paths.fecha
@@ -264,7 +317,6 @@ Pregunta del usuario:
 				)
 					return false;
 			}
-
 			if ((filters.totalMin || filters.totalMax) && entity.paths.total) {
 				const itemTotal = getByPath(item, entity.paths.total[0]) || 0;
 				if (filters.totalMin && itemTotal < filters.totalMin)
@@ -272,23 +324,39 @@ Pregunta del usuario:
 				if (filters.totalMax && itemTotal > filters.totalMax)
 					return false;
 			}
-
 			return true;
 		});
+
+		// Los push IDs de Firebase son ordenables cronológicamente como string,
+		// así que sirven para "último/primero ingresado" sin timestamp extra.
+		const orden = filters.orden || "reciente";
+		results = results.sort((a, b) =>
+			orden === "reciente"
+				? a.id < b.id
+					? 1
+					: -1
+				: a.id < b.id
+					? -1
+					: 1,
+		);
+
+		const total = results.length;
 
 		if (filters.respuestaEsperada === "conteo") {
 			return NextResponse.json({
 				filters,
-				total: results.length,
-				mensaje: `Se encontraron ${results.length} ${entity.label.toLowerCase()} que cumplen los filtros.`,
+				total,
+				mensaje: `Se encontraron ${total} ${entity.label.toLowerCase()} que cumplen los filtros.`,
 			});
 		}
 
-		return NextResponse.json({
-			filters,
-			total: results.length,
-			results: results.slice(0, 20),
-		});
+		const limite = filters.limite || 20;
+		const limitados = results.slice(0, limite).map((item) => ({
+			...item,
+			_display: buildDisplay(item, entity),
+		}));
+
+		return NextResponse.json({ filters, total, results: limitados });
 	} catch (error) {
 		console.error("[API /filter] Error:", error);
 		if (error?.name === "ZodError") {
