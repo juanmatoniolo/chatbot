@@ -1,23 +1,23 @@
 // src/app/api/filter/route.js
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import {
-	getFacturas,
-	getSiniestros,
-	getUTI,
-	getCirugias,
-} from "@/lib/firebase-admin";
+import { ENTITY_SCHEMA, ENTITY_KEYS } from "@/lib/entity-schema";
+import { getEntityData } from "@/lib/firebase-admin";
 
 // ---------------------------------------------------------------------------
-// Esquema de Zod: define lo que la IA debe extraer
+// Esquemas dinámicos (se arman solos a partir de ENTITY_SCHEMA)
 // ---------------------------------------------------------------------------
 const filterSchema = z.object({
-	entidad: z.enum(["factura", "siniestro", "uti", "cirugia"]),
-	artSeguro: z.string().optional(),
+	entidad: z.enum(ENTITY_KEYS),
 	dni: z.string().optional(),
-	pacienteNombre: z.string().optional(),
-	estado: z.enum(["borrador", "cerrado"]).optional(),
+	nombre: z.string().optional(),
+	art: z.string().optional(),
+	estado: z.string().optional(),
 	activo: z.boolean().optional(),
+	realizada: z.boolean().optional(),
+	especialidad: z.string().optional(),
+	matricula: z.string().optional(),
+	texto: z.string().optional(),
 	fechaDesde: z.string().optional(),
 	fechaHasta: z.string().optional(),
 	totalMin: z.number().optional(),
@@ -25,36 +25,38 @@ const filterSchema = z.object({
 	respuestaEsperada: z.enum(["lista", "conteo", "detalle"]),
 });
 
-// ---------------------------------------------------------------------------
-// Esquema nativo de Google
-// ---------------------------------------------------------------------------
 const googleResponseSchema = {
 	type: "OBJECT",
 	properties: {
-		entidad: {
+		entidad: { type: "STRING", enum: ENTITY_KEYS },
+		dni: {
 			type: "STRING",
-			enum: ["factura", "siniestro", "uti", "cirugia"],
-			description: "Qué tipo de registro busca el usuario.",
+			description: "Solo dígitos, sin puntos ni guiones.",
 		},
-		artSeguro: {
+		nombre: {
 			type: "STRING",
-			description: "Obra social / ART mencionada.",
+			description: "Nombre o apellido de persona.",
 		},
-		dni: { type: "STRING", description: "DNI del paciente, solo dígitos." },
-		pacienteNombre: { type: "STRING", description: "Nombre del paciente." },
+		art: { type: "STRING", description: "Obra social / ART." },
 		estado: {
 			type: "STRING",
-			enum: ["borrador", "cerrado"],
-			description: "Estado del registro. Solo facturas.",
+			description: "Estado del registro (ej. borrador, cerrado, activo).",
 		},
-		activo: {
+		activo: { type: "BOOLEAN" },
+		realizada: {
 			type: "BOOLEAN",
-			description: "Solo UTI: true = internado, false = alta.",
+			description: "Solo cirugía: true=realizada, false=pendiente.",
 		},
-		fechaDesde: { type: "STRING", description: "Fecha mínima ISO 8601." },
-		fechaHasta: { type: "STRING", description: "Fecha máxima ISO 8601." },
-		totalMin: { type: "NUMBER", description: "Monto total mínimo." },
-		totalMax: { type: "NUMBER", description: "Monto total máximo." },
+		especialidad: { type: "STRING", description: "Solo médicos." },
+		matricula: { type: "STRING", description: "Solo médicos." },
+		texto: {
+			type: "STRING",
+			description: "Búsqueda libre en notas/textos.",
+		},
+		fechaDesde: { type: "STRING", description: "ISO 8601." },
+		fechaHasta: { type: "STRING", description: "ISO 8601." },
+		totalMin: { type: "NUMBER" },
+		totalMax: { type: "NUMBER" },
 		respuestaEsperada: {
 			type: "STRING",
 			enum: ["lista", "conteo", "detalle"],
@@ -63,8 +65,25 @@ const googleResponseSchema = {
 	required: ["entidad", "respuestaEsperada"],
 };
 
+const normalizeDigits = (s = "") => String(s).replace(/\D/g, "");
+
+function getByPath(obj, path) {
+	return path
+		.split(".")
+		.reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+
+function matchesText(item, paths, query) {
+	if (!paths) return false;
+	return paths.some((p) => {
+		const v = getByPath(item, p);
+		if (v === undefined || v === null) return false;
+		return String(v).toLowerCase().includes(query.toLowerCase());
+	});
+}
+
 // ---------------------------------------------------------------------------
-// Helper: llama a Google con fallback entre modelos y reintentos
+// Fallback entre modelos de Gemini
 // ---------------------------------------------------------------------------
 async function callGoogleWithFallback({ apiKey, prompt, responseSchema }) {
 	const models = [
@@ -73,77 +92,54 @@ async function callGoogleWithFallback({ apiKey, prompt, responseSchema }) {
 		"gemini-2.5-flash",
 		"gemini-2.5-pro",
 	];
-
-	const MAX_RETRIES_PER_MODEL = 2;
+	const MAX_RETRIES = 2;
 	let lastError = null;
 
 	for (const model of models) {
-		for (let attempt = 1; attempt <= MAX_RETRIES_PER_MODEL; attempt++) {
+		for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
 			try {
 				const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
-				const response = await fetch(url, {
+				const res = await fetch(url, {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({
 						contents: [{ parts: [{ text: prompt }] }],
 						generationConfig: {
 							responseMimeType: "application/json",
-							responseSchema: responseSchema,
+							responseSchema,
 						},
 					}),
 				});
 
-				if (response.status === 503 || response.status === 429) {
-					console.warn(
-						`[Google API] ${model} intento ${attempt}/${MAX_RETRIES_PER_MODEL} falló con ${response.status}. Reintentando...`,
-					);
+				if (res.status === 503 || res.status === 429) {
 					lastError = new Error(
-						`${model} no disponible (${response.status})`,
+						`${model} no disponible (${res.status})`,
 					);
 					await new Promise((r) => setTimeout(r, 1000 * attempt));
 					continue;
 				}
-
-				if (response.status === 404) {
-					console.warn(
-						`[Google API] ${model} no existe (404). Probando siguiente...`,
-					);
+				if (res.status === 404) {
 					lastError = new Error(`${model} no encontrado`);
 					break;
 				}
-
-				if (!response.ok) {
-					const body = await response.text();
-					throw new Error(`Google API ${response.status}: ${body}`);
-				}
-
-				console.log(
-					`[Google API] Respondió ${model} en intento ${attempt}.`,
-				);
-				return await response.json();
+				if (!res.ok)
+					throw new Error(
+						`Google API ${res.status}: ${await res.text()}`,
+					);
+				return await res.json();
 			} catch (err) {
 				lastError = err;
-				console.error(`[Google API] Error con ${model}:`, err.message);
-				if (attempt < MAX_RETRIES_PER_MODEL) {
+				if (attempt < MAX_RETRIES)
 					await new Promise((r) => setTimeout(r, 1000 * attempt));
-				}
 			}
 		}
 	}
-
-	throw new Error(
-		`Todos los modelos fallaron. Último error: ${lastError?.message || "desconocido"}`,
-	);
+	throw new Error(`Todos los modelos fallaron. ${lastError?.message || ""}`);
 }
 
-// ---------------------------------------------------------------------------
-// POST /api/filter
-// ---------------------------------------------------------------------------
 export async function POST(request) {
 	try {
 		const { message } = await request.json();
-
 		if (!message || typeof message !== "string" || !message.trim()) {
 			return NextResponse.json(
 				{ error: 'El campo "message" es requerido.' },
@@ -154,28 +150,28 @@ export async function POST(request) {
 		const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
 		if (!apiKey) {
 			return NextResponse.json(
-				{ error: "Falta GOOGLE_GENERATIVE_AI_API_KEY en .env.local" },
+				{ error: "Falta GOOGLE_GENERATIVE_AI_API_KEY." },
 				{ status: 500 },
 			);
 		}
 
-		const prompt = `Sos un asistente de una clínica médica. Traducí la pregunta del usuario a filtros estructurados.
+		const hoy = new Date().toISOString().slice(0, 10);
 
-Contexto de la base de datos:
-- "factura": facturas médicas. Campos: paciente.artSeguro, paciente.dni, paciente.nombreCompleto, estado ("borrador" o "cerrado"), totales.total, paciente.fechaAtencion.
-- "siniestro": reclamos de ART. Campos: dni, status, artKey.
-- "uti": internaciones. Campos: activo (true/false), paciente, dni, diagnosticoActual.
-- "cirugia": cirugías. Campos: doctor, pacienteDatos.dni, fechaEstimada, realizada.
+		const entidadesDescripcion = ENTITY_KEYS.map(
+			(k) => `- "${k}": ${ENTITY_SCHEMA[k].description}`,
+		).join("\n");
+
+		const prompt = `Sos el asistente de búsqueda interno de una clínica médica. Traducí la pregunta a filtros estructurados.
+Hoy es ${hoy}. Usá esta fecha para calcular rangos relativos.
+
+Entidades disponibles (usá SOLO estas, no existen otras):
+${entidadesDescripcion}
 
 Reglas:
-- Si el usuario no especifica entidad, deducila del contexto.
-- Si menciona un nombre suelto, buscá en pacienteNombre.
-- Si menciona un número de 7-8 dígitos, probablemente sea DNI.
-- Para fechas relativas, calculá el rango ISO usando la fecha actual.
-- Normalizá los nombres de obras sociales.
-- "cuántos" → respuestaEsperada = "conteo".
-- "muéstrame X" o "busca a X" → respuestaEsperada = "lista".
-- "contame sobre X" → respuestaEsperada = "detalle".
+- Si preguntan por el total de pacientes en general (sin contexto de factura, ART, cirugía, etc.), usá entidad="historiaClinica" — es el índice maestro de pacientes.
+- DNI: solo dígitos, sin puntos ni guiones.
+- "cuántos/cuántas" → respuestaEsperada="conteo". "buscá/mostrame" → "lista". "contame sobre/detalle de" → "detalle".
+- Si la pregunta no encaja en ninguna entidad de la lista, elegí la más cercana igual.
 
 Pregunta del usuario:
 "${message.trim()}"`;
@@ -185,108 +181,97 @@ Pregunta del usuario:
 			prompt,
 			responseSchema: googleResponseSchema,
 		});
-
 		const jsonText = googleData.candidates?.[0]?.content?.parts?.[0]?.text;
-		if (!jsonText) {
+		if (!jsonText)
 			throw new Error("La IA no devolvió una respuesta válida.");
-		}
 
-		const parsed = JSON.parse(jsonText);
-		const filters = filterSchema.parse(parsed);
-
-		let data = [];
-		switch (filters.entidad) {
-			case "factura":
-				data = await getFacturas();
-				break;
-			case "siniestro":
-				data = await getSiniestros();
-				break;
-			case "uti":
-				data = await getUTI();
-				break;
-			case "cirugia":
-				data = await getCirugias();
-				break;
-			default:
-				data = [];
-		}
+		const filters = filterSchema.parse(JSON.parse(jsonText));
+		const entity = ENTITY_SCHEMA[filters.entidad];
+		const data = await getEntityData(filters.entidad);
 
 		const results = data.filter((item) => {
-			if (filters.dni) {
-				const itemDni =
-					item.dni ||
-					item.paciente?.dni ||
-					item.pacienteDatos?.dni ||
-					"";
-				const normalizedItem = String(itemDni).replace(/\D/g, "");
-				const normalizedQuery = filters.dni.replace(/\D/g, "");
-				if (!normalizedItem.includes(normalizedQuery)) return false;
-			}
-
-			if (filters.artSeguro) {
-				const itemArt =
-					item.artSeguro ||
-					item.paciente?.artSeguro ||
-					item.artKey ||
-					"";
-				if (
-					!String(itemArt)
-						.toLowerCase()
-						.includes(filters.artSeguro.toLowerCase())
-				) {
+			if (filters.dni && entity.paths.dni) {
+				const itemDni = normalizeDigits(
+					getByPath(item, entity.paths.dni[0]) || "",
+				);
+				if (!itemDni.includes(normalizeDigits(filters.dni)))
 					return false;
-				}
 			}
-
-			if (filters.pacienteNombre) {
-				const itemNombre =
-					item.paciente ||
-					item.nombre ||
-					item.paciente?.nombreCompleto ||
-					item.pacienteDatos?.nombreCompleto ||
-					"";
-				if (
-					!String(itemNombre)
-						.toLowerCase()
-						.includes(filters.pacienteNombre.toLowerCase())
-				) {
+			if (filters.nombre && entity.paths.nombre) {
+				if (!matchesText(item, entity.paths.nombre, filters.nombre))
 					return false;
-				}
+			}
+			if (filters.art && entity.paths.art) {
+				if (!matchesText(item, entity.paths.art, filters.art))
+					return false;
+			}
+			if (filters.estado && entity.paths.estado) {
+				const itemEstado = getByPath(item, entity.paths.estado[0]);
+				if (itemEstado !== filters.estado) return false;
+			}
+			if (filters.activo !== undefined && entity.paths.activo) {
+				if (getByPath(item, entity.paths.activo[0]) !== filters.activo)
+					return false;
+			}
+			if (filters.realizada !== undefined && entity.paths.realizada) {
+				if (
+					getByPath(item, entity.paths.realizada[0]) !==
+					filters.realizada
+				)
+					return false;
+			}
+			if (filters.especialidad && entity.paths.especialidad) {
+				if (
+					!matchesText(
+						item,
+						entity.paths.especialidad,
+						filters.especialidad,
+					)
+				)
+					return false;
+			}
+			if (filters.matricula && entity.paths.matricula) {
+				const v = getByPath(item, entity.paths.matricula[0]) || "";
+				if (
+					!String(v)
+						.toLowerCase()
+						.includes(filters.matricula.toLowerCase())
+				)
+					return false;
+			}
+			if (filters.texto && entity.paths.texto) {
+				if (!matchesText(item, entity.paths.texto, filters.texto))
+					return false;
 			}
 
-			if (filters.estado && item.estado !== filters.estado) return false;
-			if (filters.activo !== undefined && item.activo !== filters.activo)
-				return false;
+			if (
+				(filters.fechaDesde || filters.fechaHasta) &&
+				entity.paths.fecha
+			) {
+				const itemFecha = entity.paths.fecha
+					.map((p) => getByPath(item, p))
+					.find(Boolean);
+				if (
+					filters.fechaDesde &&
+					itemFecha &&
+					itemFecha < filters.fechaDesde
+				)
+					return false;
+				if (
+					filters.fechaHasta &&
+					itemFecha &&
+					itemFecha > filters.fechaHasta
+				)
+					return false;
+			}
 
-			const itemFecha =
-				item.fechaAtencion ||
-				item.paciente?.fechaAtencion ||
-				item.fechaEstimada ||
-				null;
-			if (
-				filters.fechaDesde &&
-				itemFecha &&
-				itemFecha < filters.fechaDesde
-			)
-				return false;
-			if (
-				filters.fechaHasta &&
-				itemFecha &&
-				itemFecha > filters.fechaHasta
-			)
-				return false;
-
-			if (
-				filters.totalMin &&
-				(item.totales?.total || 0) < filters.totalMin
-			)
-				return false;
-			if (
-				filters.totalMax &&
-				(item.totales?.total || 0) > filters.totalMax
-			)
-				return false;
+			if ((filters.totalMin || filters.totalMax) && entity.paths.total) {
+				const itemTotal = getByPath(item, entity.paths.total[0]) || 0;
+				if (filters.totalMin && itemTotal < filters.totalMin)
+					return false;
+				if (filters.totalMax && itemTotal > filters.totalMax)
+					return false;
+			}
 
 			return true;
 		});
@@ -295,7 +280,7 @@ Pregunta del usuario:
 			return NextResponse.json({
 				filters,
 				total: results.length,
-				mensaje: `Se encontraron ${results.length} ${filters.entidad}(s) que cumplen los filtros.`,
+				mensaje: `Se encontraron ${results.length} ${entity.label.toLowerCase()} que cumplen los filtros.`,
 			});
 		}
 
@@ -306,7 +291,6 @@ Pregunta del usuario:
 		});
 	} catch (error) {
 		console.error("[API /filter] Error:", error);
-
 		if (error?.name === "ZodError") {
 			return NextResponse.json(
 				{
@@ -315,7 +299,6 @@ Pregunta del usuario:
 				{ status: 502 },
 			);
 		}
-
 		return NextResponse.json(
 			{ error: error.message || "Error interno del servidor." },
 			{ status: 500 },
